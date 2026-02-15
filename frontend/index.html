@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reddit Fetcher</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+        h1 { margin-bottom: 1.5rem; }
+        .input-row { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
+        input { flex: 1; padding: 0.5rem 0.75rem; border: 1px solid #ccc; border-radius: 4px; font-size: 1rem; }
+        button { padding: 0.5rem 1.25rem; background: #0066ff; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; }
+        button:hover { background: #0052cc; }
+        button:disabled { background: #999; cursor: not-allowed; }
+        .result { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-top: 1rem; }
+        .result h2 { margin-bottom: 0.5rem; font-size: 1.1rem; }
+        .result .meta { color: #666; font-size: 0.85rem; margin-bottom: 0.5rem; }
+        .result .text { margin-top: 0.75rem; white-space: pre-wrap; }
+        .result a { color: #0066ff; }
+        .error { color: #cc0000; margin-top: 1rem; }
+        .loading { color: #666; margin-top: 1rem; }
+    </style>
+</head>
+<body>
+    <h1>Reddit Fetcher</h1>
+    <div class="input-row">
+        <input type="text" id="subreddit" placeholder="Subreddit name, e.g. python" />
+        <button id="fetch-btn" onclick="fetchPost()">Fetch</button>
+    </div>
+    <div id="output"></div>
+
+    <script>
+        async function fetchPost() {
+            const sub = document.getElementById('subreddit').value.trim();
+            const output = document.getElementById('output');
+            const btn = document.getElementById('fetch-btn');
+
+            if (!sub) return;
+
+            btn.disabled = true;
+            output.innerHTML = '<div class="loading">Fetching...</div>';
+
+            try {
+                const createResp = await fetch('/api/jobs', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ subreddit: sub })
+                });
+
+                if (!createResp.ok) {
+                    throw new Error('Failed to create job');
+                }
+
+                const { job_id } = await createResp.json();
+
+                // Poll for result
+                for (let i = 0; i < 30; i++) {
+                    await new Promise(r => setTimeout(r, 500));
+                    const statusResp = await fetch(`/api/jobs/${job_id}`);
+                    const data = await statusResp.json();
+
+                    if (data.status === 'completed') {
+                        renderPost(data.result);
+                        return;
+                    }
+                    if (data.status === 'failed') {
+                        output.innerHTML = `<div class="error">Error: ${data.error}</div>`;
+                        return;
+                    }
+                }
+
+                output.innerHTML = '<div class="error">Timeout waiting for result</div>';
+            } catch (e) {
+                output.innerHTML = `<div class="error">Error: ${e.message}</div>`;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function renderPost(post) {
+            document.getElementById('output').innerHTML = `
+                <div class="result">
+                    <h2>${escapeHtml(post.title)}</h2>
+                    <div class="meta">
+                        r/${escapeHtml(post.subreddit)} &middot;
+                        u/${escapeHtml(post.author)} &middot;
+                        ${post.score} points &middot;
+                        ${post.num_comments} comments &middot;
+                        ${new Date(post.created_utc).toLocaleString()}
+                    </div>
+                    <div><a href="${escapeHtml(post.permalink)}" target="_blank">View on Reddit</a></div>
+                    ${post.selftext !== '(no text)' ? `<div class="text">${escapeHtml(post.selftext)}</div>` : ''}
+                </div>
+            `;
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        document.getElementById('subreddit').addEventListener('keydown', e => {
+            if (e.key === 'Enter') fetchPost();
+        });
+    </script>
+</body>
+</html>

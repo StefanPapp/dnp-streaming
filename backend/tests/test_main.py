@@ -35,7 +35,7 @@ def test_websocket_receives_posts():
     mock_msg.key = b"python"
     mock_msg.value = json.dumps(post_data).encode()
 
-    async def mock_consume():
+    async def mock_consume(self):
         yield mock_msg
 
     mock_consumer.__aiter__ = mock_consume
@@ -56,7 +56,7 @@ def test_websocket_sends_subscribe_control():
     mock_consumer = AsyncMock()
     mock_producer = AsyncMock()
 
-    async def mock_consume():
+    async def mock_consume(self):
         return
         yield
 

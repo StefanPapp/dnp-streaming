@@ -1,18 +1,16 @@
-"""FastAPI application for the Reddit fetcher."""
+"""FastAPI application for Reddit streaming via Kafka + WebSocket."""
 
+import json
 import logging
 import os
 
-from fastapi import FastAPI, HTTPException
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from redis.asyncio import Redis
-
-from app.models import JobCreate, JobStatus
-from app.redis_client import create_job, get_job_status
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Reddit Fetcher API")
+app = FastAPI(title="Reddit Streamer API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,41 +19,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+TOPIC_POSTS = "reddit-posts"
+TOPIC_CONTROL = "reddit-control"
 
 
-def get_redis() -> Redis:
-    """Get a Redis connection."""
-    return Redis.from_url(REDIS_URL, decode_responses=True)
+def create_producer() -> AIOKafkaProducer:
+    """Create a Kafka producer."""
+    return AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP)
 
 
-@app.post("/api/jobs", response_model=JobStatus, status_code=201)
-async def create_fetch_job(body: JobCreate) -> JobStatus:
-    """Create a new Reddit fetch job."""
-    redis = get_redis()
+def create_consumer(subreddit: str) -> AIOKafkaConsumer:
+    """Create a Kafka consumer for reddit-posts topic."""
+    return AIOKafkaConsumer(
+        TOPIC_POSTS,
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        group_id=None,
+        auto_offset_reset="latest",
+    )
+
+
+@app.websocket("/ws/{subreddit}")
+async def stream_subreddit(websocket: WebSocket, subreddit: str) -> None:
+    """Stream Reddit posts for a subreddit via WebSocket."""
+    await websocket.accept()
+    subreddit = subreddit.removeprefix("r/")
+
+    producer = create_producer()
+    consumer = create_consumer(subreddit)
+
+    await producer.start()
+    await consumer.start()
+
+    await producer.send_and_wait(
+        TOPIC_CONTROL,
+        key=subreddit.encode(),
+        value=json.dumps({"action": "subscribe", "subreddit": subreddit}).encode(),
+    )
+    logger.info("Client subscribed to r/%s", subreddit)
+
     try:
-        job_id = await create_job(redis, body.subreddit)
-        return JobStatus(job_id=job_id, status="pending")
+        async for msg in consumer:
+            if msg.key and msg.key.decode() == subreddit:
+                post = json.loads(msg.value)
+                await websocket.send_json(post)
+    except WebSocketDisconnect:
+        logger.info("Client disconnected from r/%s", subreddit)
     finally:
-        await redis.aclose()
-
-
-@app.get("/api/jobs/{job_id}", response_model=JobStatus)
-async def get_fetch_job(job_id: str) -> JobStatus:
-    """Get the status of a fetch job."""
-    redis = get_redis()
-    try:
-        data = await get_job_status(redis, job_id)
-        if data is None:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return JobStatus(
-            job_id=job_id,
-            status=data["status"],
-            result=data.get("result"),
-            error=data.get("error"),
-        )
-    finally:
-        await redis.aclose()
+        try:
+            await producer.send_and_wait(
+                TOPIC_CONTROL,
+                key=subreddit.encode(),
+                value=json.dumps({"action": "unsubscribe", "subreddit": subreddit}).encode(),
+            )
+        except Exception:
+            logger.exception("Failed to send unsubscribe for r/%s", subreddit)
+        await consumer.stop()
+        await producer.stop()
 
 
 @app.get("/api/health")

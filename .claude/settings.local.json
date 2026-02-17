@@ -7,7 +7,16 @@
       "Bash(docker-compose:*)",
       "Bash(git init:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git -C /Users/stefanpapp/src/own/dnp/streaming log --oneline -10)",
+      "Bash(git -C /Users/stefanpapp/src/own/dnp/streaming add docker-compose.yml .gitignore)",
+      "Bash(git -C:*)",
+      "Bash(curl:*)",
+      "Bash(git checkout:*)",
+      "Bash(git log:*)",
+      "Bash(docker pull:*)",
+      "WebSearch",
+      "Bash(python3:*)"
     ]
   }
 }

@@ -1,12 +1,10 @@
-"""Pydantic models for the Reddit fetcher API."""
-
-from typing import Any
+"""Pydantic models for the Reddit streaming API."""
 
 from pydantic import BaseModel, field_validator
 
 
-class JobCreate(BaseModel):
-    """Request body for creating a fetch job."""
+class StreamRequest(BaseModel):
+    """Request to start streaming a subreddit."""
 
     subreddit: str
 
@@ -15,12 +13,3 @@ class JobCreate(BaseModel):
     def strip_prefix(cls, v: str) -> str:
         """Remove r/ prefix if present."""
         return v.removeprefix("r/")
-
-
-class JobStatus(BaseModel):
-    """Response model for job status."""
-
-    job_id: str
-    status: str
-    result: dict[str, Any] | None = None
-    error: str | None = None

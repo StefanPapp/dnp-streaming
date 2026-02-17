@@ -3,96 +3,124 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Reddit Fetcher</title>
+    <title>Reddit Stream</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+        body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
         h1 { margin-bottom: 1.5rem; }
-        .input-row { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
+        .input-row { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
         input { flex: 1; padding: 0.5rem 0.75rem; border: 1px solid #ccc; border-radius: 4px; font-size: 1rem; }
-        button { padding: 0.5rem 1.25rem; background: #0066ff; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; }
-        button:hover { background: #0052cc; }
+        button { padding: 0.5rem 1.25rem; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; }
+        #start-btn { background: #0066ff; }
+        #start-btn:hover { background: #0052cc; }
+        #stop-btn { background: #cc0000; display: none; }
+        #stop-btn:hover { background: #aa0000; }
         button:disabled { background: #999; cursor: not-allowed; }
-        .result { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-top: 1rem; }
-        .result h2 { margin-bottom: 0.5rem; font-size: 1.1rem; }
-        .result .meta { color: #666; font-size: 0.85rem; margin-bottom: 0.5rem; }
-        .result .text { margin-top: 0.75rem; white-space: pre-wrap; }
-        .result a { color: #0066ff; }
-        .error { color: #cc0000; margin-top: 1rem; }
-        .loading { color: #666; margin-top: 1rem; }
+        .status { margin-bottom: 1rem; font-size: 0.9rem; color: #666; }
+        .status.connected { color: #00aa44; }
+        .status.error { color: #cc0000; }
+        #feed { display: flex; flex-direction: column; gap: 0.75rem; }
+        .post { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; animation: fadeIn 0.3s ease-in; }
+        .post h2 { margin-bottom: 0.5rem; font-size: 1.05rem; }
+        .post .meta { color: #666; font-size: 0.85rem; margin-bottom: 0.5rem; }
+        .post .text { margin-top: 0.75rem; white-space: pre-wrap; font-size: 0.9rem; color: #333; }
+        .post a { color: #0066ff; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
 <body>
-    <h1>Reddit Fetcher</h1>
+    <h1>Reddit Stream</h1>
     <div class="input-row">
         <input type="text" id="subreddit" placeholder="Subreddit name, e.g. python" />
-        <button id="fetch-btn" onclick="fetchPost()">Fetch</button>
+        <button id="start-btn" onclick="startStream()">Stream</button>
+        <button id="stop-btn" onclick="stopStream()">Stop</button>
     </div>
-    <div id="output"></div>
+    <div id="status" class="status"></div>
+    <div id="feed"></div>
 
     <script>
-        async function fetchPost() {
-            const sub = document.getElementById('subreddit').value.trim();
-            const output = document.getElementById('output');
-            const btn = document.getElementById('fetch-btn');
+        let ws = null;
 
+        function startStream() {
+            const sub = document.getElementById('subreddit').value.trim().replace(/^r\//, '');
             if (!sub) return;
 
-            btn.disabled = true;
-            output.innerHTML = '<div class="loading">Fetching...</div>';
+            stopStream();
 
-            try {
-                const createResp = await fetch('/api/jobs', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ subreddit: sub })
-                });
+            const statusEl = document.getElementById('status');
+            const feed = document.getElementById('feed');
+            feed.innerHTML = '';
 
-                if (!createResp.ok) {
-                    throw new Error('Failed to create job');
-                }
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${location.host}/ws/${sub}`;
 
-                const { job_id } = await createResp.json();
+            statusEl.textContent = `Connecting to r/${sub}...`;
+            statusEl.className = 'status';
 
-                // Poll for result
-                for (let i = 0; i < 30; i++) {
-                    await new Promise(r => setTimeout(r, 500));
-                    const statusResp = await fetch(`/api/jobs/${job_id}`);
-                    const data = await statusResp.json();
+            ws = new WebSocket(wsUrl);
 
-                    if (data.status === 'completed') {
-                        renderPost(data.result);
-                        return;
-                    }
-                    if (data.status === 'failed') {
-                        output.innerHTML = `<div class="error">Error: ${data.error}</div>`;
-                        return;
-                    }
-                }
+            ws.onopen = () => {
+                statusEl.textContent = `Connected — streaming r/${sub}`;
+                statusEl.className = 'status connected';
+                document.getElementById('start-btn').style.display = 'none';
+                document.getElementById('stop-btn').style.display = 'inline-block';
+                document.getElementById('subreddit').disabled = true;
+            };
 
-                output.innerHTML = '<div class="error">Timeout waiting for result</div>';
-            } catch (e) {
-                output.innerHTML = `<div class="error">Error: ${e.message}</div>`;
-            } finally {
-                btn.disabled = false;
+            ws.onmessage = (event) => {
+                const post = JSON.parse(event.data);
+                renderPost(post);
+            };
+
+            ws.onclose = () => {
+                statusEl.textContent = 'Disconnected';
+                statusEl.className = 'status';
+                resetButtons();
+            };
+
+            ws.onerror = () => {
+                statusEl.textContent = 'Connection error';
+                statusEl.className = 'status error';
+                resetButtons();
+            };
+        }
+
+        function stopStream() {
+            if (ws) {
+                ws.close();
+                ws = null;
             }
+            resetButtons();
+        }
+
+        function resetButtons() {
+            document.getElementById('start-btn').style.display = 'inline-block';
+            document.getElementById('stop-btn').style.display = 'none';
+            document.getElementById('subreddit').disabled = false;
         }
 
         function renderPost(post) {
-            document.getElementById('output').innerHTML = `
-                <div class="result">
-                    <h2>${escapeHtml(post.title)}</h2>
-                    <div class="meta">
-                        r/${escapeHtml(post.subreddit)} &middot;
-                        u/${escapeHtml(post.author)} &middot;
-                        ${post.score} points &middot;
-                        ${post.num_comments} comments &middot;
-                        ${new Date(post.created_utc).toLocaleString()}
-                    </div>
-                    <div><a href="${escapeHtml(post.permalink)}" target="_blank">View on Reddit</a></div>
-                    ${post.selftext !== '(no text)' ? `<div class="text">${escapeHtml(post.selftext)}</div>` : ''}
+            const feed = document.getElementById('feed');
+            const div = document.createElement('div');
+            div.className = 'post';
+            div.innerHTML = `
+                <h2>${escapeHtml(post.title)}</h2>
+                <div class="meta">
+                    r/${escapeHtml(post.subreddit)} &middot;
+                    u/${escapeHtml(post.author)} &middot;
+                    ${post.score} points &middot;
+                    ${post.num_comments} comments &middot;
+                    ${new Date(post.created_utc).toLocaleString()}
                 </div>
+                <div><a href="${escapeHtml(post.permalink)}" target="_blank">View on Reddit</a></div>
+                ${post.selftext && post.selftext !== '(no text)' ? `<div class="text">${escapeHtml(post.selftext)}</div>` : ''}
             `;
+            feed.prepend(div);
+
+            // Cap displayed posts at 100
+            while (feed.children.length > 100) {
+                feed.removeChild(feed.lastChild);
+            }
         }
 
         function escapeHtml(str) {
@@ -102,7 +130,7 @@
         }
 
         document.getElementById('subreddit').addEventListener('keydown', e => {
-            if (e.key === 'Enter') fetchPost();
+            if (e.key === 'Enter') startStream();
         });
     </script>
 </body>

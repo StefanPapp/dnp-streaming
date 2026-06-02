@@ -1,6 +1,7 @@
 """Tests for the Reddit Kafka streaming worker."""
 
 import json
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -8,85 +9,77 @@ import pytest
 from worker import fetch_latest_posts, RedditStreamer
 
 
-SAMPLE_REDDIT_RESPONSE = {
-    "data": {
-        "children": [
-            {
-                "data": {
-                    "name": "t3_abc123",
-                    "title": "Test Post 1",
-                    "author": "user1",
-                    "score": 42,
-                    "url": "https://example.com/1",
-                    "permalink": "/r/python/comments/abc123/test1/",
-                    "selftext": "Hello world",
-                    "created_utc": 1700000000.0,
-                    "num_comments": 5,
-                    "subreddit": "python",
-                }
-            },
-            {
-                "data": {
-                    "name": "t3_def456",
-                    "title": "Test Post 2",
-                    "author": "user2",
-                    "score": 10,
-                    "url": "https://example.com/2",
-                    "permalink": "/r/python/comments/def456/test2/",
-                    "selftext": "",
-                    "created_utc": 1700000100.0,
-                    "num_comments": 2,
-                    "subreddit": "python",
-                }
-            },
-        ]
-    }
-}
+SAMPLE_ATOM = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>newest submissions : python</title>
+  <entry>
+    <author><name>/u/user1</name></author>
+    <id>t3_abc123</id>
+    <link href="https://www.reddit.com/r/python/comments/abc123/test1/" />
+    <published>2023-11-14T22:13:20+00:00</published>
+    <updated>2023-11-14T22:13:20+00:00</updated>
+    <title>Test Post 1</title>
+    <content type="html">&lt;p&gt;Hello world&lt;/p&gt;</content>
+  </entry>
+  <entry>
+    <author><name>/u/user2</name></author>
+    <id>t3_def456</id>
+    <link href="https://www.reddit.com/r/python/comments/def456/test2/" />
+    <published>2023-11-14T22:15:00+00:00</published>
+    <updated>2023-11-14T22:15:00+00:00</updated>
+    <title>Test Post 2</title>
+    <content type="html">&lt;p&gt;Second post&lt;/p&gt;</content>
+  </entry>
+</feed>
+"""
+
+EMPTY_ATOM = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>newest submissions : nothing</title>
+</feed>
+"""
 
 
-def test_fetch_latest_posts_success():
-    mock_response = MagicMock()
-    mock_response.json.return_value = SAMPLE_REDDIT_RESPONSE
-    mock_response.raise_for_status = MagicMock()
+def _rss_response(content: bytes) -> MagicMock:
+    resp = MagicMock()
+    resp.content = content
+    resp.raise_for_status = MagicMock()
+    return resp
 
-    with (
-        patch("worker.httpx.get", return_value=mock_response),
-        patch("worker.get_access_token", return_value="fake_token"),
-    ):
+
+def test_fetch_latest_posts_parses_rss():
+    with patch("worker.httpx.get", return_value=_rss_response(SAMPLE_ATOM)):
         posts = fetch_latest_posts("python")
 
     assert len(posts) == 2
-    assert posts[0]["title"] == "Test Post 1"
-    assert posts[0]["post_id"] == "t3_abc123"
+    first = posts[0]
+    assert first["post_id"] == "t3_abc123"
+    assert first["title"] == "Test Post 1"
+    assert first["author"] == "user1"  # "/u/" prefix stripped
+    assert first["url"] == "https://www.reddit.com/r/python/comments/abc123/test1/"
+    assert first["subreddit"] == "python"
+    # Fields the RSS feed cannot provide default to 0.
+    assert first["score"] == 0
+    assert first["num_comments"] == 0
+    # created_utc must be an ISO-8601 string the storage worker can parse.
+    assert datetime.fromisoformat(first["created_utc"])
     assert posts[1]["post_id"] == "t3_def456"
 
 
-def test_fetch_latest_posts_empty():
-    mock_response = MagicMock()
-    mock_response.json.return_value = {"data": {"children": []}}
-    mock_response.raise_for_status = MagicMock()
+def test_fetch_latest_posts_needs_no_auth():
+    """The RSS path must carry no OAuth/credential machinery."""
+    import worker
 
-    with (
-        patch("worker.httpx.get", return_value=mock_response),
-        patch("worker.get_access_token", return_value="fake_token"),
-    ):
+    assert not hasattr(worker, "get_access_token")
+    with patch("worker.httpx.get", return_value=_rss_response(SAMPLE_ATOM)):
+        posts = fetch_latest_posts("python")
+    assert all(not p["author"].startswith("/u/") for p in posts)
+
+
+def test_fetch_latest_posts_empty():
+    with patch("worker.httpx.get", return_value=_rss_response(EMPTY_ATOM)):
         with pytest.raises(ValueError, match="No posts found"):
             fetch_latest_posts("nonexistent_sub")
-
-
-def test_fetch_latest_posts_includes_post_id():
-    mock_response = MagicMock()
-    mock_response.json.return_value = SAMPLE_REDDIT_RESPONSE
-    mock_response.raise_for_status = MagicMock()
-
-    with (
-        patch("worker.httpx.get", return_value=mock_response),
-        patch("worker.get_access_token", return_value="fake_token"),
-    ):
-        posts = fetch_latest_posts("python")
-
-    for post in posts:
-        assert "post_id" in post
 
 
 @pytest.mark.asyncio

@@ -133,6 +133,42 @@ async def test_streamer_deduplicates_posts():
 
 
 @pytest.mark.asyncio
+async def test_produce_new_posts_survives_fetch_error():
+    """A non-HTTP error from fetch (e.g. missing creds → RuntimeError) is
+    contained so the poll loop keeps running instead of crashing the worker."""
+    mock_producer = AsyncMock()
+    streamer = RedditStreamer(
+        kafka_bootstrap="localhost:9092",
+        producer=mock_producer,
+    )
+    streamer.subscriptions = {"python"}
+
+    with patch("worker.fetch_latest_posts", side_effect=RuntimeError("creds missing")):
+        # Must not propagate.
+        await streamer.produce_new_posts("python")
+
+    mock_producer.send_and_wait.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_produce_new_posts_survives_producer_error():
+    """A Kafka send failure for one subreddit is contained, not fatal."""
+    mock_producer = AsyncMock()
+    mock_producer.send_and_wait.side_effect = RuntimeError("kafka unavailable")
+    streamer = RedditStreamer(
+        kafka_bootstrap="localhost:9092",
+        producer=mock_producer,
+    )
+    streamer.subscriptions = {"python"}
+
+    posts = [{"post_id": "t3_abc", "title": "Post A", "subreddit": "python"}]
+
+    with patch("worker.fetch_latest_posts", return_value=posts):
+        # Must not propagate.
+        await streamer.produce_new_posts("python")
+
+
+@pytest.mark.asyncio
 async def test_handle_control_subscribe():
     mock_producer = AsyncMock()
     streamer = RedditStreamer(

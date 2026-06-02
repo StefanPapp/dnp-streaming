@@ -37,6 +37,8 @@ services:
     environment:
       - KAFKA_BOOTSTRAP=kafka:9092
       - POLL_INTERVAL=30
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
     depends_on:
       kafka:
         condition: service_healthy

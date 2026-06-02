@@ -133,29 +133,35 @@ class RedditStreamer:
             logger.info("Unsubscribed from r/%s (active: %d)", subreddit, len(self.subscriptions))
 
     async def produce_new_posts(self, subreddit: str) -> None:
-        """Fetch and publish new posts for a subreddit."""
+        """Fetch and publish new posts for a subreddit.
+
+        Any failure fetching or publishing is logged and contained so a single
+        bad poll (missing/invalid creds, a Reddit hiccup, a Kafka blip) never
+        tears down the worker — the next poll cycle simply retries. ``except
+        Exception`` deliberately excludes ``CancelledError`` so shutdown still
+        propagates cleanly.
+        """
         try:
             posts = fetch_latest_posts(subreddit)
-        except (httpx.HTTPStatusError, ValueError):
-            logger.exception("Failed to fetch r/%s", subreddit)
-            return
 
-        seen = self.seen_ids.setdefault(subreddit, set())
-        for post in posts:
-            if post["post_id"] not in seen:
-                seen.add(post["post_id"])
-                await self.producer.send_and_wait(
-                    TOPIC_POSTS,
-                    key=subreddit.encode(),
-                    value=json.dumps(post).encode(),
-                )
-                logger.info("Published post %s from r/%s", post["post_id"], subreddit)
+            seen = self.seen_ids.setdefault(subreddit, set())
+            for post in posts:
+                if post["post_id"] not in seen:
+                    seen.add(post["post_id"])
+                    await self.producer.send_and_wait(
+                        TOPIC_POSTS,
+                        key=subreddit.encode(),
+                        value=json.dumps(post).encode(),
+                    )
+                    logger.info("Published post %s from r/%s", post["post_id"], subreddit)
 
-        # Cap seen set to prevent unbounded growth
-        if len(seen) > 500:
-            excess = len(seen) - 500
-            for _ in range(excess):
-                seen.pop()
+            # Cap seen set to prevent unbounded growth
+            if len(seen) > 500:
+                excess = len(seen) - 500
+                for _ in range(excess):
+                    seen.pop()
+        except Exception:
+            logger.exception("Skipping r/%s this cycle", subreddit)
 
     async def poll_loop(self) -> None:
         """Periodically poll all subscribed subreddits."""

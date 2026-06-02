@@ -1,12 +1,14 @@
-"""Reddit Kafka streaming worker — polls subreddits, produces to Kafka."""
+"""Reddit Kafka streaming worker — polls subreddit RSS feeds, produces to Kafka."""
 
 import asyncio
+import html
 import json
 import logging
 import os
-import time
+import re
 from datetime import UTC, datetime
 
+import feedparser
 import httpx
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
@@ -15,97 +17,81 @@ logger = logging.getLogger(__name__)
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 REDDIT_BASE_URL = "https://www.reddit.com"
-REDDIT_OAUTH_URL = "https://oauth.reddit.com"
-REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
-REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = os.getenv(
     "REDDIT_USER_AGENT",
-    "python:reddit-kafka-streamer:v2.0 (streaming worker)",
+    "python:reddit-rss-streamer:v3.0 (streaming worker)",
 )
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 TOPIC_POSTS = "reddit-posts"
 TOPIC_CONTROL = "reddit-control"
 
-_token_cache: dict = {"token": None, "expires_at": 0.0}
+
+def _strip_html(raw: str) -> str:
+    """Reduce an HTML fragment to collapsed plain text."""
+    text = re.sub(r"<[^>]+>", " ", raw)
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
 
 
-def get_access_token() -> str:
-    """Return a valid Reddit OAuth access token, refreshing if needed.
+def _entry_to_post(entry, subreddit: str) -> dict:
+    """Map a feedparser Atom entry to the post schema used across the pipeline.
 
-    Raises:
-        RuntimeError: If REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET aren't set.
-        httpx.HTTPStatusError: If the token request fails.
+    The public RSS feed exposes no score or comment count, so those fields are
+    set to 0; every other field keeps the same shape as the former OAuth path
+    so the Kafka payload, storage worker, and dashboard are unaffected.
     """
-    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
-        raise RuntimeError(
-            "REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET must be set; "
-            "create a 'script' app at https://www.reddit.com/prefs/apps"
-        )
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if parsed:
+        created = datetime(*parsed[:6], tzinfo=UTC).isoformat()
+    else:
+        created = entry.get("published") or entry.get("updated") or ""
 
-    if _token_cache["token"] and time.time() < _token_cache["expires_at"]:
-        return _token_cache["token"]
+    summary = entry.get("summary") or ""
+    if not summary and entry.get("content"):
+        summary = entry["content"][0].get("value", "")
 
-    response = httpx.post(
-        REDDIT_TOKEN_URL,
-        auth=(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
-        data={"grant_type": "client_credentials"},
-        headers={"User-Agent": REDDIT_USER_AGENT},
-        timeout=10,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    _token_cache["token"] = payload["access_token"]
-    # Refresh 60s before actual expiry to avoid edge-case 401s mid-request.
-    _token_cache["expires_at"] = time.time() + payload["expires_in"] - 60
-    return _token_cache["token"]
+    link = entry.get("link", "")
+    return {
+        "post_id": entry.get("id", ""),
+        "title": entry.get("title", ""),
+        "author": (entry.get("author") or "").removeprefix("/u/"),
+        "score": 0,  # not exposed by the RSS feed
+        "url": link,
+        "permalink": link,
+        "selftext": _strip_html(summary)[:500] or "(no text)",
+        "created_utc": created,
+        "num_comments": 0,  # not exposed by the RSS feed
+        "subreddit": subreddit,
+    }
 
 
 def fetch_latest_posts(subreddit: str) -> list[dict]:
-    """Fetch latest posts from a subreddit via the OAuth API.
+    """Fetch latest posts from a subreddit's public RSS/Atom feed.
+
+    Uses the unauthenticated ``/new/.rss`` feed, so no Reddit credentials are
+    required. A descriptive User-Agent is still sent — Reddit rate-limits
+    generic agents.
 
     Args:
         subreddit: Name of the subreddit (without r/ prefix).
 
     Returns:
-        List of post dictionaries with post_id field.
+        List of post dictionaries with a ``post_id`` field.
 
     Raises:
         httpx.HTTPStatusError: If the request fails.
-        ValueError: If no posts are found.
+        ValueError: If the feed contains no entries.
     """
-    url = f"{REDDIT_OAUTH_URL}/r/{subreddit}/new?limit=10"
-    headers = {
-        "Authorization": f"Bearer {get_access_token()}",
-        "User-Agent": REDDIT_USER_AGENT,
-    }
+    url = f"{REDDIT_BASE_URL}/r/{subreddit}/new/.rss"
+    headers = {"User-Agent": REDDIT_USER_AGENT}
 
     response = httpx.get(url, headers=headers, follow_redirects=True, timeout=10)
     response.raise_for_status()
 
-    data = response.json()
-    children = data.get("data", {}).get("children", [])
-
-    if not children:
+    feed = feedparser.parse(response.content)
+    if not feed.entries:
         raise ValueError(f"No posts found in r/{subreddit}")
 
-    posts = []
-    for child in children:
-        post = child["data"]
-        created = datetime.fromtimestamp(post["created_utc"], tz=UTC)
-        posts.append({
-            "post_id": post["name"],
-            "title": post["title"],
-            "author": post["author"],
-            "score": post["score"],
-            "url": post["url"],
-            "permalink": f"{REDDIT_BASE_URL}{post['permalink']}",
-            "selftext": post.get("selftext", "")[:500] or "(no text)",
-            "created_utc": created.isoformat(),
-            "num_comments": post["num_comments"],
-            "subreddit": post["subreddit"],
-        })
-    return posts
+    return [_entry_to_post(entry, subreddit) for entry in feed.entries]
 
 
 class RedditStreamer:
